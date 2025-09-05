@@ -1,306 +1,294 @@
 """
-Anubis Bot - Main Telegram Interface (Fixed)
+Enhanced Error Handler for Anubis Bot
+Add this to your bot.py file
 """
 
-import os
-import asyncio
+import traceback
+import sys
 from datetime import datetime
 from typing import Optional
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+from telegram import Update
+from telegram.ext import ContextTypes
 from loguru import logger
-from database import Database
-from pump_monitor import PumpFunMonitor
 
-load_dotenv()
+class ErrorHandler:
+    """Comprehensive error handling with detailed diagnostics"""
+    
+    def __init__(self, bot_instance):
+        self.bot = bot_instance
+        self.admin_chat_id = os.getenv('ADMIN_TELEGRAM_ID')  # Optional: your Telegram ID for error alerts
+        
+        # Configure detailed logging
+        logger.remove()  # Remove default handler
+        logger.add(
+            sys.stderr,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            level="DEBUG" if os.getenv('BOT_ENV') == 'development' else "INFO"
+        )
+        logger.add(
+            "logs/anubis_{time}.log",
+            rotation="1 day",
+            retention="7 days",
+            format="{time} | {level} | {name}:{function}:{line} - {message}",
+            level="DEBUG"
+        )
+    
+    async def handle_error(self, update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler with detailed diagnostics"""
+        
+        # Get the error details
+        error = context.error
+        error_type = type(error).__name__
+        error_module = type(error).__module__
+        
+        # Get traceback
+        tb_list = traceback.format_exception(type(error), error, error.__traceback__)
+        tb_string = ''.join(tb_list)
+        
+        # Extract specific error location
+        if error.__traceback__:
+            tb = error.__traceback__
+            while tb.tb_next:
+                tb = tb.tb_next
+            error_file = tb.tb_frame.f_code.co_filename
+            error_line = tb.tb_lineno
+            error_function = tb.tb_frame.f_code.co_name
+        else:
+            error_file = "Unknown"
+            error_line = 0
+            error_function = "Unknown"
+        
+        # Create detailed error report
+        error_report = f"""
+🚨 ERROR DETECTED 🚨
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📍 Location:
+   File: {error_file}
+   Function: {error_function}()
+   Line: {error_line}
 
+❌ Error Type: {error_module}.{error_type}
+💬 Message: {str(error)}
+
+📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        """
+        
+        # Log the full error
+        logger.error(f"{error_report}\n\n📋 Full Traceback:\n{tb_string}")
+        
+        # Handle specific error types with helpful messages
+        user_message = await self.get_user_friendly_message(error, error_type)
+        
+        # Send error to user if update exists
+        if update and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    f"❌ {user_message}\n\n"
+                    f"Error Code: `{error_type}_{error_line}`\n"
+                    f"Please try again or contact support.",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass  # Avoid error loop if sending fails
+        
+        # Send detailed error to admin (optional)
+        if self.admin_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=self.admin_chat_id,
+                    text=f"```\n{error_report}\n```",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+        
+        # Handle critical errors that should restart the bot
+        if self.is_critical_error(error):
+            logger.critical(f"CRITICAL ERROR - Bot may need restart: {error_type}")
+            # Optionally trigger a restart or alert
+    
+    async def get_user_friendly_message(self, error: Exception, error_type: str) -> str:
+        """Convert technical errors to user-friendly messages"""
+        
+        error_messages = {
+            # Database errors
+            'ConnectionError': "Database connection issue. Please try again in a moment.",
+            'OperationalError': "Database is temporarily unavailable.",
+            'IntegrityError': "Data conflict detected. This wallet may already be tracked.",
+            
+            # Redis errors
+            'RedisError': "Cache system issue. Performance may be degraded.",
+            'ConnectionRefusedError': "Cannot connect to cache service.",
+            
+            # Solana/RPC errors
+            'JSONRPCError': "Blockchain connection issue. Please try again.",
+            'SolanaRpcException': "Cannot reach Solana network.",
+            'TimeoutError': "Request timed out. The network may be congested.",
+            
+            # Telegram errors
+            'NetworkError': "Network connection issue.",
+            'BadRequest': "Invalid request format.",
+            'Unauthorized': "Bot authorization issue.",
+            'MessageNotModified': "No changes to update.",
+            'MessageToDeleteNotFound': "Message already deleted.",
+            
+            # Input validation
+            'ValueError': "Invalid input provided. Please check your command.",
+            'KeyError': "Missing required data.",
+            'AttributeError': "Internal configuration issue.",
+            
+            # Rate limiting
+            'RetryAfterError': f"Rate limited. Please wait {getattr(error, 'retry_after', 60)} seconds.",
+        }
+        
+        # Check for specific error strings
+        error_str = str(error).lower()
+        if 'address' in error_str:
+            return "Invalid wallet address format. Please check and try again."
+        elif 'connection' in error_str:
+            return "Connection issue detected. Retrying..."
+        elif 'timeout' in error_str:
+            return "Request timed out. Please try again."
+        elif 'permission' in error_str:
+            return "Permission denied. Please check bot settings."
+        
+        return error_messages.get(error_type, f"An unexpected error occurred: {error_type}")
+    
+    def is_critical_error(self, error: Exception) -> bool:
+        """Identify errors that require bot restart"""
+        critical_errors = [
+            'AsyncIOError',
+            'SystemExit',
+            'KeyboardInterrupt',
+            'RuntimeError',
+            'MemoryError',
+        ]
+        return type(error).__name__ in critical_errors
+    
+    async def startup_check(self) -> dict:
+        """Run startup diagnostics to catch configuration issues early"""
+        checks = {
+            'telegram_token': False,
+            'database': False,
+            'redis': False,
+            'solana_rpc': False
+        }
+        errors = []
+        
+        # Check Telegram token
+        try:
+            if os.getenv('TELEGRAM_BOT_TOKEN'):
+                checks['telegram_token'] = True
+            else:
+                errors.append("❌ TELEGRAM_BOT_TOKEN not set in environment")
+        except Exception as e:
+            errors.append(f"❌ Telegram token check failed: {e}")
+        
+        # Check database connection
+        try:
+            if self.bot.db:
+                await self.bot.db.pool.fetchval("SELECT 1")
+                checks['database'] = True
+                logger.info("✅ Database connection verified")
+        except Exception as e:
+            errors.append(f"❌ Database connection failed: {e}")
+            logger.error(f"Database check failed: {e}")
+        
+        # Check Redis (if configured)
+        try:
+            redis_url = os.getenv('REDIS_URL')
+            if redis_url and redis_url != 'redis://localhost:6379':
+                # Only check if Redis is actually configured
+                import aioredis
+                redis = await aioredis.from_url(redis_url)
+                await redis.ping()
+                await redis.close()
+                checks['redis'] = True
+                logger.info("✅ Redis connection verified")
+        except:
+            # Redis is optional, so just log
+            logger.warning("⚠️ Redis not available - caching disabled")
+        
+        # Check Solana RPC
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    os.getenv('SOLANA_RPC_URL'),
+                    json={"jsonrpc": "2.0", "id": 1, "method": "getHealth"}
+                )
+                if response.status_code == 200:
+                    checks['solana_rpc'] = True
+                    logger.info("✅ Solana RPC connection verified")
+        except Exception as e:
+            errors.append(f"❌ Solana RPC check failed: {e}")
+        
+        # Log startup report
+        logger.info("="*50)
+        logger.info("STARTUP DIAGNOSTICS COMPLETE")
+        logger.info(f"✅ Passed: {sum(checks.values())}/{len(checks)}")
+        for service, status in checks.items():
+            logger.info(f"  {service}: {'✅' if status else '❌'}")
+        
+        if errors:
+            logger.error("STARTUP ERRORS DETECTED:")
+            for error in errors:
+                logger.error(f"  {error}")
+        logger.info("="*50)
+        
+        return {'checks': checks, 'errors': errors}
+
+
+# Integration with your AnubisBot class:
 class AnubisBot:
-    """Main bot class - all data from database"""
+    """Add this to your existing AnubisBot class"""
     
     def __init__(self):
-        self.token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.db = Database(os.getenv('DATABASE_URL'))
-        self.pump_monitor = None
-        self.application = None
-        self.monitor_task = None
-        
+        # ... existing code ...
+        self.error_handler = ErrorHandler(self)
+    
     async def post_init(self, application: Application) -> None:
-        """Initialize after application is created"""
-        await self.db.connect()
-        
-        # Initialize Pump.fun monitor
-        self.pump_monitor = PumpFunMonitor(
-            os.getenv('SOLANA_RPC_URL'),
-            self.db
-        )
-        
-        # Start monitoring in background
-        self.monitor_task = asyncio.create_task(self.pump_monitor.start_monitoring())
-        logger.info("Bot initialization complete")
+        """Enhanced initialization with error checking"""
+        try:
+            # Run startup diagnostics
+            startup_results = await self.error_handler.startup_check()
+            
+            if startup_results['errors']:
+                logger.warning(f"Starting with {len(startup_results['errors'])} issues")
+            
+            # Continue with normal initialization
+            await self.db.connect()
+            
+            # Initialize Pump.fun monitor with error handling
+            try:
+                self.pump_monitor = PumpFunMonitor(
+                    os.getenv('SOLANA_RPC_URL'),
+                    self.db
+                )
+                self.monitor_task = asyncio.create_task(
+                    self.monitor_with_error_handling()
+                )
+            except Exception as e:
+                logger.error(f"Failed to start Pump.fun monitor: {e}")
+                # Bot can still run without monitor
+            
+            logger.info("✅ Bot initialization complete")
+            
+        except Exception as e:
+            logger.critical(f"FAILED TO INITIALIZE BOT: {e}")
+            raise
     
-    async def post_shutdown(self, application: Application) -> None:
-        """Cleanup on shutdown"""
-        if self.monitor_task:
-            self.monitor_task.cancel()
-        
-        if self.pump_monitor:
-            await self.pump_monitor.stop_monitoring()
-        
-        await self.db.disconnect()
-        logger.info("Bot shutdown complete")
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user = update.effective_user
-        
-        # Save user to database
-        await self.db.upsert_user(
-            user.id,
-            username=user.username,
-            first_name=user.first_name
-        )
-        
-        message = f"""
-🚀 **Welcome to Anubis Bot**
-
-I track Solana developer wallets and alert you to new token launches.
-
-**Available Commands:**
-/track `<wallet>` - Track a developer wallet
-/list - Show your tracked wallets
-/stats `<wallet>` - Get developer statistics
-/recent - Show recent launches
-/help - Show help
-
-Start by tracking a wallet address!
-        """
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Recent Launches", callback_data="recent"),
-                InlineKeyboardButton("❓ Help", callback_data="help")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            message,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    async def track_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Track a developer wallet"""
-        user_id = update.effective_user.id
-        
-        if not context.args:
-            await update.message.reply_text(
-                "Please provide a wallet address:\n`/track <wallet_address>`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        wallet_address = context.args[0]
-        
-        # Basic validation (32-44 chars)
-        if not (32 <= len(wallet_address) <= 44):
-            await update.message.reply_text(
-                "❌ Invalid Solana address format",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Track the wallet
-        success = await self.db.track_wallet(user_id, wallet_address)
-        
-        if success:
-            # Check if we have data on this developer
-            developer = await self.db.get_developer(wallet_address)
-            
-            if developer and developer['total_launches'] > 0:
-                msg = f"""
-✅ **Tracking Started**
-
-Address: `{wallet_address[:8]}...{wallet_address[-8:]}`
-
-**Developer Stats:**
-- Total Launches: {developer['total_launches']}
-- Success Rate: {developer['success_rate']:.1f}%
-- Last Active: {developer['last_active'].strftime('%Y-%m-%d') if developer['last_active'] else 'Unknown'}
-
-You'll receive alerts for new launches.
-                """
-            else:
-                msg = f"""
-✅ **Tracking Started**
-
-Address: `{wallet_address[:8]}...{wallet_address[-8:]}`
-
-No historical data yet. I'll alert you when this wallet launches tokens.
-                """
-            
-            await update.message.reply_text(msg, parse_mode='Markdown')
-        else:
-            await update.message.reply_text(
-                "❌ Failed to track wallet. Please try again.",
-                parse_mode='Markdown'
-            )
-    
-    async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List tracked wallets"""
-        user_id = update.effective_user.id
-        wallets = await self.db.get_tracked_wallets(user_id)
-        
-        if not wallets:
-            await update.message.reply_text(
-                "You're not tracking any wallets yet.\nUse `/track <wallet>` to start!",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = "📊 **Your Tracked Wallets**\n\n"
-        
-        for wallet in wallets:
-            addr = wallet['wallet_address']
-            alias = wallet['alias'] or f"{addr[:8]}...{addr[-8:]}"
-            
-            # Add actual stats if available
-            launches = wallet.get('total_launches', 0)
-            success_rate = wallet.get('success_rate', 0)
-            
-            if launches > 0:
-                msg += f"• `{alias}`\n  Launches: {launches} | Success: {success_rate:.1f}%\n\n"
-            else:
-                msg += f"• `{alias}`\n  No launch data yet\n\n"
-        
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show developer statistics"""
-        if not context.args:
-            await update.message.reply_text(
-                "Please provide a wallet address:\n`/stats <wallet_address>`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        wallet_address = context.args[0]
-        
-        # Get developer data
-        developer = await self.db.get_developer(wallet_address)
-        
-        if not developer or developer['total_launches'] == 0:
-            await update.message.reply_text(
-                f"No data available for this wallet.\nAddress: `{wallet_address[:8]}...{wallet_address[-8:]}`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Get pattern analysis
-        patterns = await self.pump_monitor.analyze_developer_patterns(wallet_address)
-        
-        msg = f"""
-📈 **Developer Statistics**
-
-Wallet: `{wallet_address[:8]}...{wallet_address[-8:]}`
-
-**Launch History:**
-- Total Launches: {developer['total_launches']}
-- Successful: {developer['successful_launches']}
-- Success Rate: {developer['success_rate']:.1f}%
-
-**Financial Performance:**
-- Total Earnings: ${developer['total_earnings']:,.0f}
-- Average Earnings: ${developer['average_earnings']:,.0f}
-- Highest ATH: ${developer['highest_ath']:,.0f}
-        """
-        
-        if patterns.get('preferred_hour') is not None:
-            msg += f"""
-
-**Patterns Detected:**
-- Preferred Launch Hour: {patterns['preferred_hour']:02d}:00 UTC
-- Preferred Day: {patterns.get('preferred_day', 'Unknown')}
-- Avg Initial Liquidity: {patterns.get('avg_liquidity', 0):.2f} SOL
-            """
-        
-        if developer['last_launch_time']:
-            msg += f"\n\nLast Launch: {developer['last_launch_time'].strftime('%Y-%m-%d %H:%M')} UTC"
-        
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    
-    async def recent_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show recent launches"""
-        launches = await self.db.get_recent_launches(hours=24)
-        
-        if not launches:
-            await update.message.reply_text(
-                "No launches detected in the last 24 hours.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        msg = "🚀 **Recent Launches (24h)**\n\n"
-        
-        for launch in launches[:10]:  # Show max 10
-            time_str = launch['launch_time'].strftime('%H:%M')
-            creator = launch['creator_wallet'][:8] + "..."
-            
-            msg += f"• {time_str} - "
-            if launch.get('token_symbol'):
-                msg += f"${launch['token_symbol']} "
-            msg += f"by {creator}\n"
-            
-            if launch.get('initial_liquidity_sol'):
-                msg += f"  Liquidity: {launch['initial_liquidity_sol']:.2f} SOL\n"
-            
-            msg += "\n"
-        
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks"""
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "recent":
-            launches = await self.db.get_recent_launches(hours=6)
-            
-            if not launches:
-                msg = "No launches in the last 6 hours."
-            else:
-                msg = "🚀 **Recent Launches (6h)**\n\n"
-                for launch in launches[:5]:
-                    time_str = launch['launch_time'].strftime('%H:%M')
-                    creator = launch['creator_wallet'][:8] + "..."
-                    msg += f"• {time_str} - by {creator}\n"
-            
-            await query.message.reply_text(msg, parse_mode='Markdown')
-        
-        elif query.data == "help":
-            help_text = """
-📖 **How to Use Anubis Bot**
-
-1. **Track Developers**: Use `/track <wallet>` to monitor wallets
-2. **Get Alerts**: Receive notifications for new launches
-3. **View Stats**: Use `/stats <wallet>` for developer metrics
-4. **Check Activity**: Use `/recent` for latest launches
-
-The bot monitors Pump.fun in real-time and builds developer profiles based on actual on-chain data.
-            """
-            await query.message.reply_text(help_text, parse_mode='Markdown')
+    async def monitor_with_error_handling(self):
+        """Wrapped monitor task with error recovery"""
+        while True:
+            try:
+                await self.pump_monitor.start_monitoring()
+            except Exception as e:
+                logger.error(f"Monitor crashed: {e}. Restarting in 30 seconds...")
+                await asyncio.sleep(30)
     
     def run(self):
-        """Start the bot with proper async handling"""
-        # Build application with post_init and post_shutdown
+        """Start the bot with error handling"""
         self.application = (
             Application.builder()
             .token(self.token)
@@ -309,7 +297,8 @@ The bot monitors Pump.fun in real-time and builds developer profiles based on ac
             .build()
         )
         
-        # Register handlers
+        # Add the error handler
+        self.application.add_error_handler(self.error_handler.handle_error)
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("track", self.track_command))
         self.application.add_handler(CommandHandler("list", self.list_command))
