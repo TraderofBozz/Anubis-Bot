@@ -5,7 +5,7 @@ Anubis Bot - Main Entry Point (Fixed)
 
 import sys
 import logging
-from bot import AnubisBot
+from anubis_bot import AnubisBot
 
 # Configure basic logging
 logging.basicConfig(

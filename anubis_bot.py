@@ -1,8 +1,14 @@
+"""
+Anubis Bot - Complete Implementation with Error Handling
+"""
+
 import os
+import sys
 import logging
 import asyncio
+import traceback
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,24 +20,39 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from loguru import logger
+
+# Import local modules
+from database import Database
+from pump_monitor import PumpFunMonitor
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+# Remove default logger and configure loguru
+logger.remove()
+logger.add(
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level="DEBUG" if os.getenv('BOT_ENV') == 'development' else "INFO"
 )
-logger = logging.getLogger(__name__)
+logger.add(
+    "logs/anubis_{time}.log",
+    rotation="1 day",
+    retention="7 days",
+    format="{time} | {level} | {name}:{function}:{line} - {message}",
+    level="DEBUG"
+)
 
-# Bot configuration from environment
+# Bot configuration
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+DATABASE_URL = os.getenv('DATABASE_URL')
+SOLANA_RPC_URL = os.getenv('SOLANA_RPC_URL')
 ENVIRONMENT = os.getenv('BOT_ENV', 'development')
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+ADMIN_TELEGRAM_ID = os.getenv('ADMIN_TELEGRAM_ID')
 
 # Anubis bot version
-ANUBIS_VERSION = "1.0.0"
+ANUBIS_VERSION = "2.0.0"
 
 # Emoji constants
 EMOJI = {
@@ -45,252 +66,444 @@ EMOJI = {
     'skull': '💀',
     'gem': '💎',
     'eye': '👁',
-    'siren': '🚨'
+    'siren': '🚨',
+    'bell': '🔔',
+    'mute': '🔕'
 }
 
 class AnubisBot:
-    """Main Anubis Bot class for tracking Solana developers"""
+    """Main Anubis Bot class with database integration and error handling"""
     
     def __init__(self):
+        self.token = BOT_TOKEN
+        self.db = None
+        self.pump_monitor = None
         self.application = None
+        self.monitor_task = None
         self.start_time = datetime.now()
         
+        # Verify token exists
+        if not self.token:
+            logger.critical("TELEGRAM_BOT_TOKEN not found in environment variables!")
+            raise ValueError("TELEGRAM_BOT_TOKEN is required")
+    
+    async def startup_diagnostics(self) -> Dict[str, Any]:
+        """Run startup diagnostics"""
+        checks = {
+            'telegram_token': False,
+            'database': False,
+            'solana_rpc': False
+        }
+        errors = []
+        
+        # Check Telegram token
+        if self.token:
+            checks['telegram_token'] = True
+            logger.info("✅ Telegram token verified")
+        else:
+            errors.append("❌ TELEGRAM_BOT_TOKEN not set")
+        
+        # Check database connection
+        try:
+            if DATABASE_URL:
+                self.db = Database(DATABASE_URL)
+                await self.db.connect()
+                checks['database'] = True
+                logger.info("✅ Database connection verified")
+            else:
+                errors.append("❌ DATABASE_URL not set")
+        except Exception as e:
+            errors.append(f"❌ Database connection failed: {e}")
+            logger.error(f"Database check failed: {e}")
+        
+        # Check Solana RPC
+        if SOLANA_RPC_URL:
+            checks['solana_rpc'] = True
+            logger.info("✅ Solana RPC URL configured")
+        else:
+            logger.warning("⚠️ SOLANA_RPC_URL not set - monitoring disabled")
+        
+        # Log results
+        logger.info("="*50)
+        logger.info("STARTUP DIAGNOSTICS COMPLETE")
+        logger.info(f"✅ Passed: {sum(checks.values())}/{len(checks)}")
+        for service, status in checks.items():
+            logger.info(f"  {service}: {'✅' if status else '❌'}")
+        if errors:
+            logger.error("STARTUP ERRORS:")
+            for error in errors:
+                logger.error(f"  {error}")
+        logger.info("="*50)
+        
+        return {'checks': checks, 'errors': errors}
+    
+    async def post_init(self, application: Application) -> None:
+        """Initialize after application is created"""
+        try:
+            # Run diagnostics
+            diagnostics = await self.startup_diagnostics()
+            
+            # Initialize database if not already connected
+            if not self.db and DATABASE_URL:
+                self.db = Database(DATABASE_URL)
+                await self.db.connect()
+            
+            # Initialize Pump.fun monitor if RPC available
+            if SOLANA_RPC_URL and self.db:
+                try:
+                    self.pump_monitor = PumpFunMonitor(SOLANA_RPC_URL, self.db)
+                    self.monitor_task = asyncio.create_task(self.monitor_with_recovery())
+                    logger.info("✅ Pump.fun monitor started")
+                except Exception as e:
+                    logger.error(f"Failed to start Pump.fun monitor: {e}")
+                    # Bot can still run without monitor
+            
+            logger.info(f"✅ Anubis Bot v{ANUBIS_VERSION} initialization complete")
+            
+        except Exception as e:
+            logger.critical(f"INITIALIZATION FAILED: {e}")
+            # Continue running with limited functionality
+    
+    async def post_shutdown(self, application: Application) -> None:
+        """Cleanup on shutdown"""
+        logger.info("Shutting down Anubis Bot...")
+        
+        if self.monitor_task:
+            self.monitor_task.cancel()
+        
+        if self.pump_monitor:
+            await self.pump_monitor.stop_monitoring()
+        
+        if self.db:
+            await self.db.disconnect()
+        
+        logger.info("✅ Shutdown complete")
+    
+    async def monitor_with_recovery(self):
+        """Monitor with automatic recovery on failure"""
+        while True:
+            try:
+                if self.pump_monitor:
+                    await self.pump_monitor.start_monitoring()
+            except Exception as e:
+                logger.error(f"Monitor crashed: {e}. Restarting in 30 seconds...")
+                await asyncio.sleep(30)
+    
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a message when the command /start is issued."""
+        """Handle /start command"""
         user = update.effective_user
-        welcome_message = f"""
+        
+        try:
+            # Save user to database if available
+            if self.db:
+                await self.db.upsert_user(
+                    user.id,
+                    username=user.username,
+                    first_name=user.first_name
+                )
+            
+            welcome_message = f"""
 {EMOJI['rocket']} **Welcome to Anubis Bot** {EMOJI['eye']}
 
-Track Solana developer wallets and get alerts on:
-- {EMOJI['money']} Wallet inflows (potential launches)
-- {EMOJI['rocket']} New token launches
-- {EMOJI['chart']} Developer success metrics
-- {EMOJI['fire']} High-potential opportunities
+Track Solana developer wallets and get real-time alerts!
 
 **Available Commands:**
 /track `<wallet>` - Track a developer wallet
-/untrack `<wallet>` - Stop tracking a wallet
 /list - Show your tracked wallets
 /stats `<wallet>` - Get developer statistics
-/top - Show top performing developers
-/alerts - Configure alert settings
+/recent - Show recent launches
+/top - Top performing developers
+/alerts - Configure notifications
 /help - Show detailed help
 
 **Quick Start:**
 Send me a Solana wallet address to start tracking!
 
 Version: {ANUBIS_VERSION}
-Environment: {ENVIRONMENT}
-        """
-        
-        # Create inline keyboard
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Top Devs", callback_data="top_devs"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings")
-            ],
-            [
-                InlineKeyboardButton("📖 Guide", callback_data="guide"),
-                InlineKeyboardButton("💬 Support", url="https://t.me/anubis_support")
+Status: {'🟢 Online' if self.db else '🟡 Limited Mode'}
+            """
+            
+            keyboard = [
+                [
+                    InlineKeyboardButton("📊 Recent Launches", callback_data="recent"),
+                    InlineKeyboardButton("🔥 Top Devs", callback_data="top_devs")
+                ],
+                [
+                    InlineKeyboardButton("📖 Guide", callback_data="guide"),
+                    InlineKeyboardButton("⚙️ Settings", callback_data="settings")
+                ]
             ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            welcome_message,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        
-        # Log user start
-        logger.info(f"User {user.id} (@{user.username}) started the bot")
-
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                welcome_message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            
+            logger.info(f"User {user.id} (@{user.username}) started the bot")
+            
+        except Exception as e:
+            logger.error(f"Error in start_command: {e}")
+            await self.send_error_message(update, "startup")
+    
     async def track_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Track a developer wallet"""
         user = update.effective_user
         
-        if not context.args:
-            await update.message.reply_text(
-                f"{EMOJI['warning']} Please provide a wallet address:\n"
-                "`/track <wallet_address>`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        wallet_address = context.args[0]
-        
-        # Basic Solana address validation (32-44 chars, base58)
-        if not (32 <= len(wallet_address) <= 44):
-            await update.message.reply_text(
-                f"{EMOJI['cross']} Invalid Solana wallet address!\n"
-                "Addresses should be 32-44 characters long.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # TODO: Add database check for existing tracking
-        # TODO: Add Solana RPC validation
-        
-        # For now, just confirm
-        await update.message.reply_text(
-            f"{EMOJI['check']} **Wallet Tracked Successfully!**\n\n"
-            f"Address: `{wallet_address[:8]}...{wallet_address[-8:]}`\n"
-            f"Status: Active\n"
-            f"Alerts: Enabled\n\n"
-            f"You'll receive alerts for:\n"
-            f"• Inflows > 1 SOL\n"
-            f"• New token launches\n"
-            f"• Significant events",
-            parse_mode='Markdown'
-        )
-        
-        logger.info(f"User {user.id} tracking wallet: {wallet_address}")
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Please provide a wallet address:\n"
+                    "`/track <wallet_address>`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            wallet_address = context.args[0]
+            
+            # Basic Solana address validation
+            if not (32 <= len(wallet_address) <= 44):
+                await update.message.reply_text(
+                    f"{EMOJI['cross']} Invalid Solana wallet format!\n"
+                    "Addresses should be 32-44 characters long.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            if self.db:
+                # Track the wallet
+                success = await self.db.track_wallet(user.id, wallet_address)
+                
+                if success:
+                    # Get developer stats if available
+                    developer = await self.db.get_developer(wallet_address)
+                    
+                    if developer and developer.get('total_launches', 0) > 0:
+                        msg = f"""
+{EMOJI['check']} **Tracking Started**
 
-    async def untrack_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Stop tracking a wallet"""
-        if not context.args:
-            await update.message.reply_text(
-                f"{EMOJI['warning']} Please provide a wallet address:\n"
-                "`/untrack <wallet_address>`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        wallet_address = context.args[0]
-        
-        # TODO: Remove from database
-        
-        await update.message.reply_text(
-            f"{EMOJI['check']} Stopped tracking wallet:\n`{wallet_address}`",
-            parse_mode='Markdown'
-        )
+Address: `{wallet_address[:8]}...{wallet_address[-8:]}`
 
+**Developer Stats:**
+- Total Launches: {developer['total_launches']}
+- Success Rate: {developer.get('success_rate', 0):.1f}%
+- Last Active: {developer.get('last_active', 'Unknown')}
+
+You'll receive alerts for new launches!
+                        """
+                    else:
+                        msg = f"""
+{EMOJI['check']} **Tracking Started**
+
+Address: `{wallet_address[:8]}...{wallet_address[-8:]}`
+
+No historical data yet. I'll alert you when this wallet launches tokens.
+                        """
+                    
+                    await update.message.reply_text(msg, parse_mode='Markdown')
+                else:
+                    await update.message.reply_text(
+                        f"{EMOJI['warning']} Already tracking this wallet or database error.",
+                        parse_mode='Markdown'
+                    )
+            else:
+                # Database not available - limited mode
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Bot is in limited mode. Database unavailable.\n"
+                    f"Wallet noted: `{wallet_address[:8]}...{wallet_address[-8:]}`",
+                    parse_mode='Markdown'
+                )
+            
+            logger.info(f"User {user.id} tracking wallet: {wallet_address}")
+            
+        except Exception as e:
+            logger.error(f"Error in track_command: {e}")
+            await self.send_error_message(update, "tracking")
+    
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """List all tracked wallets for user"""
-        user = update.effective_user
+        """List tracked wallets"""
+        user_id = update.effective_user.id
         
-        # TODO: Fetch from database
-        # For now, show example
-        
-        message = f"""
-{EMOJI['eye']} **Your Tracked Wallets**
-
-1. `7xKXtg...3wmTYKp` {EMOJI['check']}
-   Success Rate: 75% | Launches: 12
-   
-2. `9aHzJk...8nBqLx2` {EMOJI['check']}
-   Success Rate: 60% | Launches: 8
-   
-3. `4bNmPq...7xKlMn9` {EMOJI['warning']}
-   Success Rate: 30% | Launches: 15
-
-Total: 3 wallets tracked
-        """
-        
-        await update.message.reply_text(message, parse_mode='Markdown')
-
+        try:
+            if not self.db:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Database unavailable. Cannot retrieve tracked wallets.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            wallets = await self.db.get_tracked_wallets(user_id)
+            
+            if not wallets:
+                await update.message.reply_text(
+                    f"You're not tracking any wallets yet.\n"
+                    f"Use `/track <wallet>` to start!",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            msg = f"{EMOJI['eye']} **Your Tracked Wallets**\n\n"
+            
+            for wallet in wallets[:10]:  # Limit to 10 for message length
+                addr = wallet['wallet_address']
+                alias = wallet.get('alias') or f"{addr[:8]}...{addr[-8:]}"
+                
+                launches = wallet.get('total_launches', 0)
+                success_rate = wallet.get('success_rate', 0)
+                
+                if launches > 0:
+                    msg += f"• `{alias}`\n  Launches: {launches} | Success: {success_rate:.1f}%\n\n"
+                else:
+                    msg += f"• `{alias}`\n  No launch data yet\n\n"
+            
+            if len(wallets) > 10:
+                msg += f"\n_...and {len(wallets) - 10} more wallets_"
+            
+            await update.message.reply_text(msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in list_command: {e}")
+            await self.send_error_message(update, "listing wallets")
+    
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Show detailed stats for a developer wallet"""
-        if not context.args:
-            await update.message.reply_text(
-                f"{EMOJI['warning']} Please provide a wallet address:\n"
-                "`/stats <wallet_address>`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        wallet_address = context.args[0]
-        
-        # TODO: Fetch real stats from database
-        # Example stats for now
-        
-        stats_message = f"""
-{EMOJI['chart']} **Developer Stats**
+        """Show developer statistics"""
+        try:
+            if not context.args:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Please provide a wallet address:\n"
+                    "`/stats <wallet_address>`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            wallet_address = context.args[0]
+            
+            if not self.db:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Database unavailable. Cannot retrieve stats.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Get developer data
+            developer = await self.db.get_developer(wallet_address)
+            
+            if not developer or developer.get('total_launches', 0) == 0:
+                await update.message.reply_text(
+                    f"No data available for wallet:\n`{wallet_address[:8]}...{wallet_address[-8:]}`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Get pattern analysis if monitor available
+            patterns = {}
+            if self.pump_monitor:
+                patterns = await self.pump_monitor.analyze_developer_patterns(wallet_address)
+            
+            msg = f"""
+{EMOJI['chart']} **Developer Statistics**
 
 Wallet: `{wallet_address[:8]}...{wallet_address[-8:]}`
 
-**Performance Metrics:**
-- Total Launches: 15
-- Successful: 10 ({EMOJI['check']} 66.7%)
-- Rugged: 3 ({EMOJI['skull']} 20%)
-- Active: 2 ({EMOJI['fire']} 13.3%)
+**Launch History:**
+- Total Launches: {developer['total_launches']}
+- Successful: {developer.get('successful_launches', 0)}
+- Success Rate: {developer.get('success_rate', 0):.1f}%
 
-**Top 5 Launches:**
-1. $PEPE2 - 450x return {EMOJI['gem']}
-2. $MOON - 125x return {EMOJI['rocket']}
-3. $DOGE3 - 85x return {EMOJI['money']}
-4. $SHIB5 - 45x return
-5. $FLOKI - 12x return
+**Financial Performance:**
+- Total Earnings: ${developer.get('total_earnings', 0):,.0f}
+- Average Earnings: ${developer.get('average_earnings', 0):,.0f}
+- Highest ATH: ${developer.get('highest_ath', 0):,.0f}
+            """
+            
+            if patterns.get('preferred_hour') is not None:
+                msg += f"""
 
-**Recent Activity:**
-- Last launch: 2 hours ago
-- Last inflow: 5.2 SOL (30 min ago)
-- Avg time to rug: 4.5 hours
-- Success probability: 68%
-
-**Anubis Score: 7.8/10** {EMOJI['fire']}
-        """
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_stats:{wallet_address[:8]}"),
-                InlineKeyboardButton("🔔 Set Alert", callback_data=f"set_alert:{wallet_address[:8]}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            stats_message, 
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-
+**Patterns Detected:**
+- Preferred Hour: {patterns['preferred_hour']:02d}:00 UTC
+- Preferred Day: {patterns.get('preferred_day', 'Unknown')}
+- Avg Liquidity: {patterns.get('avg_liquidity', 0):.2f} SOL
+                """
+            
+            if developer.get('last_launch_time'):
+                last_launch = developer['last_launch_time']
+                if isinstance(last_launch, str):
+                    msg += f"\n\nLast Launch: {last_launch}"
+                else:
+                    msg += f"\n\nLast Launch: {last_launch.strftime('%Y-%m-%d %H:%M')} UTC"
+            
+            await update.message.reply_text(msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in stats_command: {e}")
+            await self.send_error_message(update, "retrieving stats")
+    
+    async def recent_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show recent launches"""
+        try:
+            if not self.db:
+                await update.message.reply_text(
+                    f"{EMOJI['warning']} Database unavailable. Cannot retrieve recent launches.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            launches = await self.db.get_recent_launches(hours=24)
+            
+            if not launches:
+                await update.message.reply_text(
+                    "No launches detected in the last 24 hours.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            msg = f"{EMOJI['rocket']} **Recent Launches (24h)**\n\n"
+            
+            for launch in launches[:10]:
+                time_str = launch['launch_time']
+                if hasattr(time_str, 'strftime'):
+                    time_str = time_str.strftime('%H:%M')
+                
+                creator = launch['creator_wallet'][:8] + "..."
+                
+                msg += f"• {time_str} - "
+                if launch.get('token_symbol'):
+                    msg += f"${launch['token_symbol']} "
+                msg += f"by {creator}\n"
+                
+                if launch.get('initial_liquidity_sol'):
+                    msg += f"  Liquidity: {launch['initial_liquidity_sol']:.2f} SOL\n"
+                
+                msg += "\n"
+            
+            await update.message.reply_text(msg, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Error in recent_command: {e}")
+            await self.send_error_message(update, "retrieving recent launches")
+    
     async def top_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show top performing developers"""
-        
-        # TODO: Fetch from database
-        # Example for now
-        
-        top_message = f"""
+        # TODO: Implement with real data from database
+        msg = f"""
 {EMOJI['fire']} **Top Performing Developers**
-*Last 7 Days*
 
-**1.** `8xNm2p...9kLmX3` {EMOJI['gem']}
-   Score: 9.5/10 | Launches: 8
-   Avg Return: 125x | Success: 87%
+Feature coming soon! This will show:
+- Highest success rate developers
+- Most profitable launches
+- Trending developers
 
-**2.** `3bKj7x...2mNpQ8` {EMOJI['rocket']}
-   Score: 8.9/10 | Launches: 12
-   Avg Return: 85x | Success: 75%
-
-**3.** `7yHm4k...5xPqL2`
-   Score: 8.2/10 | Launches: 6
-   Avg Return: 95x | Success: 83%
-
-**4.** `2nMx9p...8kJmL7`
-   Score: 7.8/10 | Launches: 15
-   Avg Return: 45x | Success: 60%
-
-**5.** `9xLm3k...4nPqB2`
-   Score: 7.5/10 | Launches: 9
-   Avg Return: 55x | Success: 66%
-
-_Updated: {datetime.now().strftime('%H:%M UTC')}_
+Stay tuned!
         """
-        
-        await update.message.reply_text(top_message, parse_mode='Markdown')
-
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    
     async def alerts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Configure alert settings"""
-        
         keyboard = [
             [
-                InlineKeyboardButton("💰 Inflow Threshold", callback_data="alert_inflow"),
-                InlineKeyboardButton("📊 Min Score", callback_data="alert_score")
-            ],
-            [
-                InlineKeyboardButton("🔔 All Alerts ON", callback_data="alerts_on"),
-                InlineKeyboardButton("🔕 All Alerts OFF", callback_data="alerts_off")
+                InlineKeyboardButton("🔔 Enable All", callback_data="alerts_on"),
+                InlineKeyboardButton("🔕 Disable All", callback_data="alerts_off")
             ],
             [
                 InlineKeyboardButton("✅ Done", callback_data="alerts_done")
@@ -298,24 +511,20 @@ _Updated: {datetime.now().strftime('%H:%M UTC')}_
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        message = f"""
-⚙️ **Alert Configuration**
+        msg = f"""
+{EMOJI['bell']} **Alert Configuration**
 
-Current Settings:
-- Inflow Threshold: 1.0 SOL
-- Min Developer Score: 5.0/10
-- Launch Alerts: Enabled
-- Rug Warnings: Enabled
+Configure your notification preferences.
 
-Select what to configure:
+Current Status: {'Enabled' if True else 'Disabled'}
         """
         
         await update.message.reply_text(
-            message,
+            msg,
             parse_mode='Markdown',
             reply_markup=reply_markup
         )
-
+    
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show help message"""
         help_text = f"""
@@ -323,19 +532,16 @@ Select what to configure:
 
 **Tracking Commands:**
 - `/track <wallet>` - Start tracking a developer
-- `/untrack <wallet>` - Stop tracking
 - `/list` - Show all tracked wallets
 - `/stats <wallet>` - Detailed developer stats
 
 **Discovery Commands:**
+- `/recent` - Recent token launches
 - `/top` - Top performing developers
-- `/trending` - Trending launches
-- `/risky` - High risk/reward devs
 
-**Alert Commands:**
+**Settings:**
 - `/alerts` - Configure notifications
-- `/mute` - Temporarily disable alerts
-- `/unmute` - Re-enable alerts
+- `/help` - Show this help message
 
 **Tips:**
 - Track wallets with 5+ successful launches
@@ -347,7 +553,7 @@ Select what to configure:
         """
         
         await update.message.reply_text(help_text, parse_mode='Markdown')
-
+    
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button callbacks"""
         query = update.callback_query
@@ -355,18 +561,33 @@ Select what to configure:
         
         data = query.data
         
-        if data == "top_devs":
-            top_message = f"""... the message ..."""
-            await query.message.reply_text(top_message, parse_mode='Markdown')  # ✅ This works!)
-        
-        elif data == "settings":
-            await query.edit_message_text(
-                "⚙️ Settings menu coming soon!",
-                parse_mode='Markdown'
-            )
-        
-        elif data == "guide":
-            guide_text = """
+        try:
+            if data == "recent":
+                # Show recent launches
+                if self.db:
+                    launches = await self.db.get_recent_launches(hours=6)
+                    
+                    if not launches:
+                        msg = "No launches in the last 6 hours."
+                    else:
+                        msg = f"{EMOJI['rocket']} **Recent Launches (6h)**\n\n"
+                        for launch in launches[:5]:
+                            time_str = launch['launch_time']
+                            if hasattr(time_str, 'strftime'):
+                                time_str = time_str.strftime('%H:%M')
+                            creator = launch['creator_wallet'][:8] + "..."
+                            msg += f"• {time_str} - by {creator}\n"
+                else:
+                    msg = "Database unavailable."
+                
+                await query.message.reply_text(msg, parse_mode='Markdown')
+            
+            elif data == "top_devs":
+                msg = f"{EMOJI['fire']} **Top Developers**\n\nFeature coming soon!"
+                await query.message.reply_text(msg, parse_mode='Markdown')
+            
+            elif data == "guide":
+                guide_text = """
 📖 **Quick Start Guide**
 
 1️⃣ **Find Good Developers:**
@@ -379,55 +600,155 @@ Select what to configure:
    
 3️⃣ **Watch for Signals:**
    • 🟢 Inflows > 5 SOL
-   • 🟢 Multiple small inflows
    • 🔴 Immediate large outflows
    
 4️⃣ **Act Fast:**
    • Buy within 30 seconds of launch
    • Set stop losses at -50%
-   • Take profits at 2-5x
 
 Good luck! 🚀
-            """
-            await query.edit_message_text(guide_text, parse_mode='Markdown')
-
+                """
+                await query.edit_message_text(guide_text, parse_mode='Markdown')
+            
+            elif data == "settings":
+                await query.edit_message_text(
+                    "⚙️ Settings menu coming soon!",
+                    parse_mode='Markdown'
+                )
+            
+            elif data == "alerts_on":
+                await query.answer("✅ Alerts enabled!", show_alert=False)
+            
+            elif data == "alerts_off":
+                await query.answer("🔕 Alerts disabled!", show_alert=False)
+            
+            elif data == "alerts_done":
+                await query.edit_message_text(
+                    "✅ Alert settings saved!",
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in button_callback: {e}")
+            await query.answer("An error occurred. Please try again.", show_alert=True)
+    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle direct messages (wallet addresses)"""
-        message_text = update.message.text
+        try:
+            message_text = update.message.text.strip()
+            
+            # Check if it looks like a Solana address
+            if 32 <= len(message_text) <= 44 and message_text.isalnum():
+                # Treat as wallet address
+                context.args = [message_text]
+                await self.track_command(update, context)
+            else:
+                await update.message.reply_text(
+                    "Send me a Solana wallet address to track, or use /help for commands.",
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            logger.error(f"Error in handle_message: {e}")
+    
+    async def error_handler(self, update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler with detailed diagnostics"""
+        error = context.error
+        error_type = type(error).__name__
         
-        # Check if it looks like a Solana address
-        if 32 <= len(message_text) <= 44 and message_text.isalnum():
-            # Treat as wallet address
-            context.args = [message_text]
-            await self.track_command(update, context)
+        # Get traceback
+        tb_list = traceback.format_exception(type(error), error, error.__traceback__)
+        tb_string = ''.join(tb_list)
+        
+        # Extract error location
+        if error.__traceback__:
+            tb = error.__traceback__
+            while tb.tb_next:
+                tb = tb.tb_next
+            error_file = tb.tb_frame.f_code.co_filename
+            error_line = tb.tb_lineno
+            error_function = tb.tb_frame.f_code.co_name
         else:
-            await update.message.reply_text(
-                "Send me a Solana wallet address to track, or use /help for commands.",
-                parse_mode='Markdown'
-            )
-
-    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Log errors"""
-        logger.error(f"Update {update} caused error {context.error}")
+            error_file = "Unknown"
+            error_line = 0
+            error_function = "Unknown"
         
+        # Log the error
+        logger.error(f"""
+ERROR DETECTED
+Location: {error_file}:{error_line} in {error_function}()
+Type: {error_type}
+Message: {str(error)}
+Traceback:
+{tb_string}
+        """)
+        
+        # Send user-friendly error message
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                f"{EMOJI['warning']} An error occurred. Please try again or contact support.",
-                parse_mode='Markdown'
-            )
-
+            user_message = self.get_user_friendly_error(error_type, str(error))
+            try:
+                await update.effective_message.reply_text(
+                    f"{EMOJI['warning']} {user_message}",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass  # Avoid error loop
+        
+        # Send detailed error to admin if configured
+        if ADMIN_TELEGRAM_ID and update:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text=f"🚨 Error: {error_type} at line {error_line}\n{str(error)[:200]}",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+    
+    def get_user_friendly_error(self, error_type: str, error_str: str) -> str:
+        """Convert technical errors to user-friendly messages"""
+        
+        error_messages = {
+            'ConnectionError': "Connection issue. Please try again.",
+            'TimeoutError': "Request timed out. Please try again.",
+            'ValueError': "Invalid input. Please check your command.",
+            'AttributeError': "Feature temporarily unavailable.",
+        }
+        
+        # Check for specific error patterns
+        error_lower = error_str.lower()
+        if 'database' in error_lower:
+            return "Database temporarily unavailable. Some features may be limited."
+        elif 'address' in error_lower:
+            return "Invalid wallet address format. Please check and try again."
+        elif 'connection' in error_lower:
+            return "Connection issue detected. Please try again."
+        
+        return error_messages.get(error_type, "An error occurred. Please try again or use /help.")
+    
+    async def send_error_message(self, update: Update, action: str) -> None:
+        """Send a generic error message"""
+        await update.message.reply_text(
+            f"{EMOJI['warning']} Error while {action}. Please try again or contact support.",
+            parse_mode='Markdown'
+        )
+    
     def run(self):
         """Start the bot"""
-        
-        # Create application
-        self.application = Application.builder().token(BOT_TOKEN).build()
+        # Build application with proper initialization
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
+            .build()
+        )
         
         # Register command handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("track", self.track_command))
-        self.application.add_handler(CommandHandler("untrack", self.untrack_command))
         self.application.add_handler(CommandHandler("list", self.list_command))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
+        self.application.add_handler(CommandHandler("recent", self.recent_command))
         self.application.add_handler(CommandHandler("top", self.top_command))
         self.application.add_handler(CommandHandler("alerts", self.alerts_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
@@ -444,177 +765,24 @@ Good luck! 🚀
         self.application.add_error_handler(self.error_handler)
         
         # Start bot
-        logger.info(f"Starting Anubis Bot v{ANUBIS_VERSION} in {ENVIRONMENT} mode...")
+        logger.info(f"🚀 Starting Anubis Bot v{ANUBIS_VERSION} in {ENVIRONMENT} mode...")
         
-        if ENVIRONMENT == 'production':
-            # Production mode - use webhook for DigitalOcean
-            port = int(os.environ.get('PORT', 8443))
-            webhook_url = os.environ.get('WEBHOOK_URL')  # You'll set this later
-            
-            if webhook_url:
-                self.application.run_webhook(
-                    listen='0.0.0.0',
-                    port=port,
-                    webhook_url=webhook_url
-                )
-            else:
-                # Fallback to polling
-                self.application.run_polling(drop_pending_updates=True)
-        else:
-            # Development mode - use polling
-            self.application.run_polling(drop_pending_updates=True)
-
-async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    
-    if data == "top_devs":
-        # Show top devs directly in the callback
-        top_message = f"""
-{EMOJI['fire']} **Top Performing Developers**
-*Last 7 Days*
-
-**1.** `8xNm2p...9kLmX3` {EMOJI['gem']}
-   Score: 9.5/10 | Launches: 8
-   Avg Return: 125x | Success: 87%
-
-**2.** `3bKj7x...2mNpQ8` {EMOJI['rocket']}
-   Score: 8.9/10 | Launches: 12
-   Avg Return: 85x | Success: 75%
-
-**3.** `7yHm4k...5xPqL2`
-   Score: 8.2/10 | Launches: 6
-   Avg Return: 95x | Success: 83%
-
-_Updated: {datetime.now().strftime('%H:%M UTC')}_
-        """
-        await query.message.reply_text(top_message, parse_mode='Markdown')
-    
-    elif data == "settings":
-        settings_keyboard = [
-            [
-                InlineKeyboardButton("💰 Inflow Threshold", callback_data="alert_inflow"),
-                InlineKeyboardButton("📊 Min Score", callback_data="alert_score")
-            ],
-            [
-                InlineKeyboardButton("🔔 Alerts ON", callback_data="alerts_on"),
-                InlineKeyboardButton("🔕 Alerts OFF", callback_data="alerts_off")
-            ],
-            [
-                InlineKeyboardButton("🔙 Back", callback_data="back_to_main")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(settings_keyboard)
-        
-        await query.edit_message_text(
-            "⚙️ **Settings**\n\nConfigure your alert preferences:",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif data == "guide":
-        guide_text = """
-📖 **Quick Start Guide**
-
-1️⃣ **Find Good Developers:**
-   • Use `/top` to see best performers
-   • Look for 60%+ success rate
-   
-2️⃣ **Track Wallets:**
-   • `/track <wallet_address>`
-   • Start with 3-5 wallets
-   
-3️⃣ **Watch for Signals:**
-   • 🟢 Inflows > 5 SOL
-   • 🟢 Multiple small inflows
-   • 🔴 Immediate large outflows
-   
-4️⃣ **Act Fast:**
-   • Buy within 30 seconds of launch
-   • Set stop losses at -50%
-   • Take profits at 2-5x
-
-Good luck! 🚀
-        """
-        back_keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
-        reply_markup = InlineKeyboardMarkup(back_keyboard)
-        
-        await query.edit_message_text(
-            guide_text, 
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif data == "back_to_main":
-        # Go back to main menu
-        welcome_message = f"""
-{EMOJI['rocket']} **Welcome to Anubis Bot** {EMOJI['eye']}
-
-Track Solana developer wallets and get alerts on:
-- {EMOJI['money']} Wallet inflows (potential launches)
-- {EMOJI['rocket']} New token launches
-- {EMOJI['chart']} Developer success metrics
-- {EMOJI['fire']} High-potential opportunities
-
-Version: {ANUBIS_VERSION}
-        """
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Top Devs", callback_data="top_devs"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings")
-            ],
-            [
-                InlineKeyboardButton("📖 Guide", callback_data="guide"),
-                InlineKeyboardButton("💬 Support", url="https://t.me/anubis_support")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            welcome_message,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-    
-    elif data == "alert_inflow":
-        await query.answer("Feature coming soon: Set your minimum SOL inflow threshold", show_alert=True)
-    
-    elif data == "alert_score":
-        await query.answer("Feature coming soon: Set minimum developer score for alerts", show_alert=True)
-    
-    elif data == "alerts_on":
-        await query.answer("✅ Alerts enabled!", show_alert=False)
-        # TODO: Save to database
-    
-    elif data == "alerts_off":
-        await query.answer("🔕 Alerts disabled!", show_alert=False)
-        # TODO: Save to database
-    
-    elif data.startswith("refresh_stats:"):
-        wallet = data.split(":")[1]
-        await query.answer(f"♻️ Refreshing stats for {wallet}...", show_alert=False)
-        # TODO: Actually refresh from blockchain
-    
-    elif data.startswith("set_alert:"):
-        wallet = data.split(":")[1]
-        await query.answer(f"🔔 Alert set for wallet {wallet}", show_alert=True)
-        # TODO: Save alert preference
+        # Use polling (works everywhere)
+        self.application.run_polling(drop_pending_updates=True)
 
 def main():
     """Main function"""
-    if not BOT_TOKEN:
-        logger.error("No TELEGRAM_BOT_TOKEN found! Please check your .env file")
-        return
-    
     try:
+        # Create logs directory if it doesn't exist
+        os.makedirs('logs', exist_ok=True)
+        
         bot = AnubisBot()
         bot.run()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.critical(f"Failed to start bot: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
