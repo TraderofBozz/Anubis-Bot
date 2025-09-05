@@ -1,6 +1,5 @@
 """
-Anubis Bot - Main Telegram Interface
-Clean implementation with NO hardcoded data
+Anubis Bot - Main Telegram Interface (Fixed)
 """
 
 import os
@@ -31,9 +30,10 @@ class AnubisBot:
         self.db = Database(os.getenv('DATABASE_URL'))
         self.pump_monitor = None
         self.application = None
+        self.monitor_task = None
         
-    async def initialize(self):
-        """Initialize bot and database"""
+    async def post_init(self, application: Application) -> None:
+        """Initialize after application is created"""
         await self.db.connect()
         
         # Initialize Pump.fun monitor
@@ -43,8 +43,20 @@ class AnubisBot:
         )
         
         # Start monitoring in background
-        asyncio.create_task(self.pump_monitor.start_monitoring())
+        self.monitor_task = asyncio.create_task(self.pump_monitor.start_monitoring())
+        logger.info("Bot initialization complete")
+    
+    async def post_shutdown(self, application: Application) -> None:
+        """Cleanup on shutdown"""
+        if self.monitor_task:
+            self.monitor_task.cancel()
         
+        if self.pump_monitor:
+            await self.pump_monitor.stop_monitoring()
+        
+        await self.db.disconnect()
+        logger.info("Bot shutdown complete")
+    
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user = update.effective_user
@@ -287,8 +299,15 @@ The bot monitors Pump.fun in real-time and builds developer profiles based on ac
             await query.message.reply_text(help_text, parse_mode='Markdown')
     
     def run(self):
-        """Start the bot"""
-        self.application = Application.builder().token(self.token).build()
+        """Start the bot with proper async handling"""
+        # Build application with post_init and post_shutdown
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
+            .build()
+        )
         
         # Register handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
@@ -298,7 +317,7 @@ The bot monitors Pump.fun in real-time and builds developer profiles based on ac
         self.application.add_handler(CommandHandler("recent", self.recent_command))
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
-        # Start bot
+        # Start bot with polling
         logger.info("Starting Anubis Bot...")
         self.application.run_polling(drop_pending_updates=True)
 
