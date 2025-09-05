@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: anubis_bot
+      POSTGRES_USER: anubis
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  bot:
+    build: .
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      DATABASE_URL: postgresql://anubis:${DB_PASSWORD}@postgres:5432/anubis_bot
+      REDIS_URL: redis://redis:6379
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL}
+      HELIUS_API_KEY: ${HELIUS_API_KEY}
+      BIRDEYE_API_KEY: ${BIRDEYE_API_KEY}
+      BOT_ENV: production
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
