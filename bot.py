@@ -328,4 +328,5 @@ async def main():
     bot.run()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot = AnubisBot()
+    bot.run()  # run() handles everything

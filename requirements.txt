@@ -19,7 +19,7 @@ base58==2.1.1
 # Remove solders line - solana will install the correct version
 
 # Data Processing
-pandas==2.1.4
+pandas==2.0.3
 numpy==1.26.2
 
 # Utilities
