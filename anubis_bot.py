@@ -10,6 +10,9 @@ import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
+from modules.historical_scanner import HistoricalScanner
+from modules.wallet_scanner import WalletScanner
+from utils.reportMissingImports2 import check_imports
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -50,6 +53,7 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 SOLANA_RPC_URL = os.getenv('SOLANA_RPC_URL')
 ENVIRONMENT = os.getenv('BOT_ENV', 'development')
 ADMIN_TELEGRAM_ID = os.getenv('ADMIN_TELEGRAM_ID')
+ADMIN_IDS = [int(ADMIN_TELEGRAM_ID)] if ADMIN_TELEGRAM_ID else []
 
 # Anubis bot version
 ANUBIS_VERSION = "2.0.0"
@@ -70,6 +74,163 @@ EMOJI = {
     'bell': '🔔',
     'mute': '🔕'
 }
+
+"""
+Historical Multi-Platform Scanner
+One-time historical data collection
+"""
+
+class HistoricalScanner:
+    def __init__(self, db):
+        self.db = db
+        self.helius_key = os.getenv('HELIUS_API_KEY')
+        self.helius_url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_key}"
+        
+        # All platforms to scan historically
+        self.platforms = {
+            "pump_fun": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "raydium_launchlab": "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",
+            "moonshot": "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG",
+            "raydium_amm": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+        }
+        
+    async def run_historical_scan(self, start_date: datetime, end_date: datetime):
+        """
+        Sequential scan of all platforms for historical data
+        This runs ONCE to populate the database
+        """
+        
+        all_results = {}
+        
+        for platform_name, program_id in self.platforms.items():
+            logger.info(f"Scanning {platform_name} from {start_date} to {end_date}")
+            
+            # Scan this platform's entire history
+            launches = await self.scan_platform_history(
+                program_id, 
+                platform_name,
+                start_date, 
+                end_date
+            )
+            
+            all_results[platform_name] = launches
+            
+            # Process and store successful launches
+            await self.process_platform_results(platform_name, launches)
+            
+            # Be nice to RPC
+            await asyncio.sleep(1)
+        
+        return all_results
+    
+    async def scan_platform_history(self, program_id: str, platform: str, 
+                                   start_date: datetime, end_date: datetime):
+        """
+        Get ALL historical transactions for a single platform
+        """
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            all_launches = []
+            before_signature = None
+            
+            while True:
+                # Get batch of signatures
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignaturesForAddress",
+                    "params": [
+                        program_id,
+                        {
+                            "limit": 1000,
+                            "before": before_signature,
+                            "commitment": "confirmed"
+                        }
+                    ]
+                }
+                
+                response = await client.post(self.helius_url, json=payload)
+                data = response.json()
+                
+                if "result" not in data or not data["result"]:
+                    break
+                
+                signatures = data["result"]
+                
+                # Process signatures in this batch
+                for sig_info in signatures:
+                    block_time = sig_info.get("blockTime", 0)
+                    if block_time == 0:
+                        continue
+                    
+                    sig_date = datetime.fromtimestamp(block_time)
+                    
+                    # Check date range
+                    if sig_date < start_date:
+                        return all_launches  # We've gone too far back
+                    
+                    if sig_date > end_date:
+                        continue  # Skip future dates
+                    
+                    # Get and parse transaction
+                    tx_data = await self.get_transaction(client, sig_info["signature"])
+                    
+                    if platform == "pump_fun":
+                        launch_info = self.parse_pump_fun_launch(tx_data)
+                    elif platform == "raydium_launchlab":
+                        launch_info = self.parse_launchlab_launch(tx_data)
+                    else:
+                        launch_info = self.parse_generic_launch(tx_data)
+                    
+                    if launch_info:
+                        launch_info["platform"] = platform
+                        launch_info["launch_time"] = sig_date
+                        all_launches.append(launch_info)
+                
+                # Pagination
+                before_signature = signatures[-1]["signature"]
+                
+                # Rate limiting
+                await asyncio.sleep(0.1)
+                
+                # Progress update
+                if len(all_launches) % 1000 == 0:
+                    logger.info(f"{platform}: Found {len(all_launches)} launches so far...")
+            
+        return all_launches
+    
+    async def process_platform_results(self, platform: str, launches: List[Dict]):
+        """
+        Store successful launches and update developer profiles
+        """
+        
+        successful_count = 0
+        
+        for launch in launches:
+            if not launch.get("mint_address"):
+                continue
+            
+            # Get token performance (market cap)
+            performance = await self.get_token_performance(launch["mint_address"])
+            
+            # Only store if successful (>$100K peak)
+            if performance.get("peak_market_cap", 0) > 100_000:
+                successful_count += 1
+                
+                # Store in archive
+                await self.store_successful_token(launch, performance)
+                
+                # Update developer profile
+                await self.update_developer_profile(
+                    launch["creator_wallet"], 
+                    platform,
+                    launch, 
+                    performance
+                )
+        
+        logger.info(f"{platform}: {successful_count}/{len(launches)} successful (>{100}K)")
+
+
 
 class AnubisBot:
     """Main Anubis Bot class with database integration and error handling"""
@@ -103,6 +264,11 @@ class AnubisBot:
         else:
             errors.append("❌ TELEGRAM_BOT_TOKEN not set")
         
+        if self.db:
+            from modules.anubis_scoring import AnubisScoringEngine, AnubisAlertSystem
+            self.scoring_engine = AnubisScoringEngine(self.db.pool)
+            self.alert_system = AnubisAlertSystem(self.db.pool, application.bot)
+
         # Check database connection
         try:
             if DATABASE_URL:
@@ -321,6 +487,40 @@ No historical data yet. I'll alert you when this wallet launches tokens.
             logger.error(f"Error in track_command: {e}")
             await self.send_error_message(update, "tracking")
     
+async def admin_scan_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: Run historical wallet scan"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("Unauthorized.")
+        return
+    
+    from modules.wallet_scanner import WalletScanner
+    scanner = WalletScanner(self.db, context.bot)
+    
+    # Parse command: /admin_scan [historical|active|status]
+    if not context.args:
+        msg = """Admin Scanner Commands:
+/admin_scan historical - Run 3-year scan (once per year)
+/admin_scan active - Update last 90 days
+/admin_scan status - Check scan progress"""
+        await update.message.reply_text(msg)
+        return
+    
+    command = context.args[0]
+    
+    if command == "historical":
+        await update.message.reply_text("🔍 Starting historical scan... This will take several hours.")
+        asyncio.create_task(scanner.run_historical_scan(update.message.chat_id, context.bot))
+        
+    elif command == "active":
+        await update.message.reply_text("📊 Updating active wallets (last 90 days)...")
+        asyncio.create_task(scanner.update_active_wallets(update.message.chat_id, context.bot))
+        
+    elif command == "status":
+        status = await scanner.get_scan_status()
+        await update.message.reply_text(f"Scan Status:\n{status}")
+
     async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """List tracked wallets"""
         user_id = update.effective_user.id
@@ -752,7 +952,8 @@ Traceback:
         self.application.add_handler(CommandHandler("top", self.top_command))
         self.application.add_handler(CommandHandler("alerts", self.alerts_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
-        
+        self.application.add_handler(CommandHandler("admin_scan", self.admin_scan_command))
+
         # Register callback handler for buttons
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
