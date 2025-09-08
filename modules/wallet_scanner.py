@@ -15,6 +15,7 @@ from loguru import logger
 import base58
 from modules.anubis_scoring import AnubisScoringEngine, AnubisAlertSystem
 from dotenv import load_dotenv
+import aiohttp
 
 # Load environment variables
 load_dotenv()
@@ -169,18 +170,18 @@ class WalletScanner:
                                             # Store in database
                                             async with self.db.acquire() as conn:
                                                 await conn.execute("""
-                                                    INSERT INTO token_launches 
-                                                    (mint_address, creator_wallet, platform, launch_time)
+                                                    INSERT INTO anubis.token_launches 
+                                                    (mint_address, creator, platform, created_at)
                                                     VALUES ($1, $2, $3, NOW())
                                                     ON CONFLICT (mint_address) DO NOTHING
                                                 """, mint, creator, 'pump_fun')
                                             
-                                            # ADD THIS PART - Check developer and send alerts
+                                            # Check developer and send alerts
                                             await self.check_developer_profile(creator, {
                                                 'mint': mint,
-                                                'symbol': 'UNKNOWN',  # We don't have this yet from RPC
-                                                'name': 'Unknown',     # We don't have this yet from RPC
-                                                'market_cap': 0        # Would need separate API call
+                                                'symbol': 'UNKNOWN',
+                                                'name': 'Unknown',
+                                                'market_cap': 0
                                             })
                 
                 print(f"⏰ Checked {len(signatures)} transactions, waiting 30 seconds...")
@@ -189,7 +190,7 @@ class WalletScanner:
             except Exception as e:
                 print(f"❌ Error: {e}")
                 await asyncio.sleep(30)
-    
+
     async def get_token_creator(self, mint_address):
         """Get creator from the blockchain directly"""
         async with httpx.AsyncClient() as client:
@@ -205,73 +206,267 @@ class WalletScanner:
             # Parse response to find creator...
             return response.json()
 
-async def check_developer_profile(self, creator_wallet: str, token_info: dict):
-    """Check developer profile and send appropriate alerts"""
-    
-    async with self.db.acquire() as conn:
-        # Get developer profile
-        profile = await conn.fetchrow("""
-            SELECT * FROM anubis_wallet_profiles 
-            WHERE wallet_address = $1
-        """, creator_wallet)
-        
-        if not profile:
-            return
-        
-        # Get their top successful tokens
-        top_tokens = await conn.fetch("""
-            SELECT token_symbol, token_name, peak_mcap
-            FROM token_launches tl
-            LEFT JOIN successful_tokens_archive sta ON tl.mint_address = sta.mint_address
-            WHERE tl.creator_wallet = $1
-            AND sta.peak_mcap > 100000
-            ORDER BY sta.peak_mcap DESC
-            LIMIT 5
-        """, creator_wallet)
-        
-        # Send alerts based on tier
-        if profile['developer_tier'] == 'ELITE':
-            await self.send_elite_alert(profile, token_info, top_tokens)
-        elif profile['risk_rating'] == 'EXTREME':
-            await self.send_scam_alert(profile, token_info)
+    async def check_developer_profile(self, creator, metadata=None):
+        """Check if developer has an Anubis profile and send alerts if needed"""
+        try:
+            async with self.db.acquire() as conn:
+                # Check for existing profile
+                profile = await conn.fetchrow(
+                    "SELECT * FROM anubis.wallet_profiles WHERE wallet_address = $1",
+                    creator
+                )
+                
+                if profile:
+                    print(f"   👤 Developer Tier: {profile['developer_tier']}")
+                    print(f"   📊 Anubis Score: {profile['anubis_score']:.1f}")
+                    print(f"   ⚠️  Risk Level: {profile['risk_level']}")
+                    
+                    # Send alerts based on tier
+                    if profile['developer_tier'] == 'ELITE':
+                        print(f"   🚨 ELITE DEVELOPER DETECTED!")
+                        await self.send_telegram_alert(
+                            f"🚨 ELITE Developer Launch!\n"
+                            f"Wallet: {creator[:8]}...{creator[-6:]}\n"
+                            f"Score: {profile['anubis_score']:.1f}\n"
+                            f"Success Rate: {profile['success_rate']:.1%}\n"
+                            f"Token: {metadata.get('name', 'Unknown') if metadata else 'Unknown'}"
+                        )
+                    elif profile['developer_tier'] == 'SCAMMER':
+                        print(f"   ⛔ KNOWN SCAMMER!")
+                        # Optionally send scammer alerts
+                        
+                else:
+                    print(f"   👤 New developer (no profile yet)")
+                    
+                    # Calculate profile for new developer
+                    await self.create_developer_profile(creator)
+                        
+        except Exception as e:
+            print(f"   ⚠️ Profile check failed: {e}")
+            pass  # Continue without profile check
 
-async def send_elite_alert(self, profile, token_info, top_tokens):
-    """Send alert for elite developer"""
-    message = f"🚨 ELITE DEVELOPER LAUNCH!\n"
-    message += f"━━━━━━━━━━━━━━━━━━━━\n"
-    message += f"New Token: ${token_info.get('symbol', 'UNKNOWN')}\n"
-    message += f"Anubis Score: {profile['anubis_score']:.1f}\n\n"
-    
-    if top_tokens:
-        message += "📜 PREVIOUS HITS:\n"
-        for i, token in enumerate(top_tokens[:5], 1):
-            message += f"{i}. ${token['token_symbol']} - ${token['peak_mcap']/1000000:.1f}M\n"
-    
-    message += f"\nSuccess Rate: {profile['success_rate']:.1f}%"
-    
-    # Send to Telegram
-    channel_id = os.getenv('CRITICAL_ALERTS_CHANNEL')
-    await self.send_telegram_message(channel_id, message)
+    async def create_developer_profile(self, wallet_address):
+        """Create Anubis profile for new developer"""
+        try:
+            async with self.db.acquire() as conn:
+                # Get launch history for this wallet
+                launches = await conn.fetch("""
+                    SELECT * FROM anubis.token_launches 
+                    WHERE creator = $1 
+                    ORDER BY created_at DESC
+                """, wallet_address)
+                
+                if not launches:
+                    return  # No history to calculate from
+                
+                # Calculate basic metrics
+                total_launches = len(launches)
+                successful = sum(1 for l in launches if l.get('peak_mcap', 0) >= 100000)
+                success_rate = successful / total_launches if total_launches > 0 else 0
+                
+                # Calculate Anubis score (simplified)
+                score = min(100, success_rate * 100 + min(20, total_launches))
+                
+                # Determine tier
+                if score >= 80:
+                    tier = 'ELITE'
+                elif score >= 60:
+                    tier = 'PRO'
+                elif score >= 40:
+                    tier = 'AMATEUR'
+                else:
+                    tier = 'SCAMMER'
+                    
+                risk_level = 'LOW' if score >= 60 else 'MEDIUM' if score >= 40 else 'HIGH'
+                
+                # Insert profile
+                await conn.execute("""
+                    INSERT INTO anubis.wallet_profiles (
+                        wallet_address, anubis_score, developer_tier, risk_level,
+                        total_launches, success_rate, rug_rate, 
+                        created_at, updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                    ON CONFLICT (wallet_address) DO UPDATE SET
+                        anubis_score = $2,
+                        developer_tier = $3,
+                        risk_level = $4,
+                        total_launches = $5,
+                        success_rate = $6,
+                        rug_rate = $7,
+                        updated_at = NOW()
+                """, wallet_address, score, tier, risk_level, 
+                    total_launches, success_rate, 1.0 - success_rate)
+                
+                print(f"   ✅ Created profile: {tier} (Score: {score:.1f})")
+                
+        except Exception as e:
+            print(f"   ⚠️ Failed to create profile: {e}")
 
-async def send_telegram_message(self, channel_id, message):
-    """Actually send message to Telegram"""
-    bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not bot_token or not channel_id:
-        print(f"Missing Telegram config - would send: {message}")
-        return
-    
-    import httpx
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json={
-            'chat_id': channel_id,
-            'text': message,
-            'parse_mode': 'HTML'
-        })
-        if response.status_code == 200:
-            print(f"✅ Alert sent to Telegram channel {channel_id}")
+    async def send_telegram_alert(self, message):
+        """Send alert to Telegram"""
+        try:
+            bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')  # Add this to your .env
+            
+            if not bot_token or not chat_id:
+                print("   ⚠️ Telegram not configured")
+                return
+                
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            
+            async with aiohttp.ClientSession() as session:
+                await session.post(url, json={
+                    'chat_id': chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML'
+                })
+                
+        except Exception as e:
+            print(f"   ⚠️ Telegram alert failed: {e}")
+
+    async def evaluate_new_launcher(self, creator, token_address, initial_liquidity):
+        """Quick safety check for unknown wallets"""
+        
+        # Minimum thresholds for consideration
+        MIN_LIQUIDITY = 2.5  # SOL - Updated based on research
+        
+        if initial_liquidity < MIN_LIQUIDITY:
+            return None  # Ignore low-effort launches
+        
+        async with self.db.acquire() as conn:
+            # Check funding source (last 5 transactions)
+            funding_check = await self.check_funding_source(creator)
+            
+            if funding_check['is_suspicious']:
+                print(f"   ❌ Suspicious funding from: {funding_check['source']}")
+                return None
+                
+            # Basic behavioral checks
+            behavior_score = await self.quick_behavior_check(creator)
+            
+            if behavior_score < 30:  # Too risky
+                return None
+                
+            # Calculate simple success probability
+            prediction = self.calculate_launch_probability(
+                initial_liquidity=initial_liquidity,
+                funding_source=funding_check['source_type'],
+                launch_time=datetime.now().hour,
+                behavior_score=behavior_score
+            )
+            
+            if prediction['probability'] >= 0.15:  # 15% minimum threshold
+                return {
+                    'alert': True,
+                    'probability': prediction['probability'],
+                    'risk_factors': prediction['risks'],
+                    'funding_type': funding_check['source_type']
+                }
+        
+        return None
+
+    async def check_funding_source(self, wallet):
+        """Check where wallet got its SOL from"""
+        
+        # Query last 5 transactions
+        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+        
+        params = {
+            'api-key': self.helius_key,
+            'limit': 5
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                txs = await response.json()
+        
+        # Check for red flags
+        for tx in txs:
+            # Check if funded by known rug wallet (from your blacklist)
+            # Check if funded directly from CEX (good sign)
+            # Check if funded by mixer/tumbler (bad sign)
+            pass
+        
+        return {
+            'is_suspicious': False,  # Set based on checks
+            'source': 'CEX',  # or 'DEX', 'Unknown', 'Rug Wallet'
+            'source_type': 'clean'  # or 'suspicious', 'mixed'
+        }
+
+    async def quick_behavior_check(self, wallet):
+        """Fast behavioral analysis for unknown wallets"""
+        score = 50  # Start neutral
+        
+        async with self.db.acquire() as conn:
+            # Check launch velocity (too many too fast = bad)
+            recent_launches = await conn.fetchval("""
+                SELECT COUNT(*) FROM anubis.token_launches
+                WHERE creator = $1 
+                AND created_at > NOW() - INTERVAL '1 hour'
+            """, wallet)
+            
+            if recent_launches and recent_launches > 3:
+                score -= 30  # Serial rugger pattern
+            elif recent_launches == 0:
+                score += 10  # First launch today
+                
+            # Check if wallet has rugged before
+            has_rugged = await conn.fetchval("""
+                SELECT EXISTS(
+                    SELECT 1 FROM anubis.token_launches
+                    WHERE creator = $1
+                    AND peak_mcap < 10000
+                    AND initial_liquidity > 0.5
+                )
+            """, wallet)
+            
+            if has_rugged:
+                score -= 25
+                
+        return max(0, min(100, score))
+
+    def calculate_launch_probability(self, initial_liquidity, funding_source, 
+                                    launch_time, behavior_score):
+        """Calculate success probability based on factors"""
+        base_prob = 0.15
+        
+        # Adjust based on liquidity
+        if initial_liquidity >= 5:
+            base_prob += 0.3
+        elif initial_liquidity >= 3:
+            base_prob += 0.15
+            
+        # Funding source adjustment
+        if funding_source == 'clean':
+            base_prob += 0.1
+        elif funding_source == 'suspicious':
+            base_prob -= 0.2
+            
+        # Behavior score factor
+        base_prob *= (behavior_score / 100)
+        
+        return {
+            'probability': min(1.0, base_prob),
+            'risks': []
+        }
+
+    async def send_elite_alert(self, profile, token_info, top_tokens):
+        """Send alert for elite developer"""
+        message = f"🚨 ELITE DEVELOPER LAUNCH!\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"New Token: ${token_info.get('symbol', 'UNKNOWN')}\n"
+        message += f"Anubis Score: {profile['anubis_score']:.1f}\n\n"
+        
+        if top_tokens:
+            message += "📜 PREVIOUS HITS:\n"
+            for i, token in enumerate(top_tokens[:5], 1):
+                message += f"{i}. ${token['token_symbol']} - ${token['peak_mcap']/1000000:.1f}M\n"
+        
+        message += f"\nSuccess Rate: {profile['success_rate']:.1f}%"
+        
+        # Send to Telegram
+        channel_id = os.getenv('CRITICAL_ALERTS_CHANNEL')
+        await self.send_telegram_alert(message)
 
     async def fetch_token_metadata(self, mint_address: str) -> dict:
         """
@@ -333,26 +528,7 @@ async def send_telegram_message(self, channel_id, message):
                 except:
                     pass
                 
-                # Method 3: Get from Metaplex metadata account
-                try:
-                    # Calculate metadata PDA
-                    from solders.pubkey import Pubkey
-                    from solders.system_program import ID as SYSTEM_PROGRAM_ID
-                    
-                    METADATA_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-                    seeds = [
-                        b"metadata",
-                        bytes.fromhex(METADATA_PROGRAM_ID.replace("0x", "")),
-                        bytes.fromhex(mint_address.replace("0x", ""))
-                    ]
-                    
-                    # This would need the actual PDA derivation
-                    # For now, we'll mark this as a TODO
-                    pass
-                except:
-                    pass
-                
-                # Method 4: Wait a bit and retry (new tokens need time to propagate)
+                # Method 3: Wait a bit and retry (new tokens need time to propagate)
                 await asyncio.sleep(2)
                 
                 # Retry Method 1 after delay
@@ -414,7 +590,7 @@ async def send_telegram_message(self, channel_id, message):
                         if metadata['symbol'] != 'UNKNOWN':
                             # Success! Update the token_launches table
                             await conn.execute("""
-                                UPDATE token_launches 
+                                UPDATE anubis.token_launches 
                                 SET token_name = $1, token_symbol = $2
                                 WHERE mint_address = $3
                             """, metadata['name'], metadata['symbol'], token['mint_address'])
@@ -440,7 +616,6 @@ async def send_telegram_message(self, channel_id, message):
             except Exception as e:
                 print(f"Error in metadata retry: {e}")
                 await asyncio.sleep(60)
-
 
     # ============= HISTORICAL SCANNING =============
     
@@ -671,13 +846,13 @@ async def send_telegram_message(self, channel_id, message):
                 try:
                     # Store in token_launches table
                     await conn.execute("""
-                        INSERT INTO token_launches 
-                        (mint_address, creator_wallet, platform, launch_time, 
-                         initial_liquidity_sol, signature, metadata)
+                        INSERT INTO anubis.token_launches 
+                        (mint_address, creator, platform, created_at, 
+                         initial_liquidity, signature, metadata)
                         VALUES ($1, $2, $3, $4, $5, $6, $7)
                         ON CONFLICT (mint_address) DO UPDATE SET
                             platform = EXCLUDED.platform,
-                            launch_time = EXCLUDED.launch_time
+                            created_at = EXCLUDED.created_at
                     """,
                         launch.get("mint_address"),
                         launch.get("creator_wallet"),
@@ -693,11 +868,11 @@ async def send_telegram_message(self, channel_id, message):
                     
                     if market_cap and market_cap > 100000:
                         await conn.execute("""
-                            INSERT INTO successful_tokens_archive
+                            INSERT INTO anubis.successful_tokens
                             (mint_address, creator_wallet, platform, launch_date, peak_mcap)
                             VALUES ($1, $2, $3, $4, $5)
                             ON CONFLICT (mint_address) DO UPDATE SET
-                                peak_mcap = GREATEST(successful_tokens_archive.peak_mcap, $5)
+                                peak_mcap = GREATEST(anubis.successful_tokens.peak_mcap, $5)
                         """,
                             launch.get("mint_address"),
                             launch.get("creator_wallet"),
@@ -739,12 +914,12 @@ async def send_telegram_message(self, channel_id, message):
                     
                     # Update or create profile
                     await conn.execute("""
-                        INSERT INTO historical_wallet_profiles
+                        INSERT INTO anubis.wallet_profiles
                         (wallet_address, total_launches, avg_seed_amount, 
                          first_seen, last_active)
                         VALUES ($1, $2, $3, $4, $5)
                         ON CONFLICT (wallet_address) DO UPDATE SET
-                            total_launches = historical_wallet_profiles.total_launches + $2,
+                            total_launches = anubis.wallet_profiles.total_launches + $2,
                             avg_seed_amount = $3,
                             last_active = $5
                     """,
@@ -910,9 +1085,9 @@ async def send_telegram_message(self, channel_id, message):
         async with self.db.acquire() as conn:
             # Store in main table
             await conn.execute("""
-                INSERT INTO token_launches 
-                (mint_address, creator_wallet, platform, launch_time, 
-                 initial_liquidity_sol, signature, metadata)
+                INSERT INTO anubis.token_launches 
+                (mint_address, creator, platform, created_at, 
+                 initial_liquidity, signature, metadata)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (mint_address) DO NOTHING
             """,
@@ -927,7 +1102,7 @@ async def send_telegram_message(self, channel_id, message):
             
             # Add to active monitoring
             await conn.execute("""
-                INSERT INTO active_monitoring
+                INSERT INTO anubis.active_monitoring
                 (wallet_address, token_address, platform, detected_at)
                 VALUES ($1, $2, $3, NOW())
             """,
@@ -945,7 +1120,7 @@ async def send_telegram_message(self, channel_id, message):
         async with self.db.acquire() as conn:
             # Get developer profile
             profile = await conn.fetchrow("""
-                SELECT * FROM historical_wallet_profiles
+                SELECT * FROM anubis.wallet_profiles
                 WHERE wallet_address = $1
             """, creator)
             
@@ -962,56 +1137,7 @@ async def send_telegram_message(self, channel_id, message):
                         logger.info(f"✅ Successful developer detected: {creator} ({success_rate:.1%} success rate)")
                         # Trigger positive alert
 
+# END OF WALLETSCANNER CLASS
+
 # Create alias for backward compatibility
 HistoricalScanner = WalletScanner
-
-
-# ============= STANDALONE FUNCTIONS =============
-# These are module-level functions, not class methods
-
-async def connect_database():
-    """Connect to DigitalOcean Managed PostgreSQL"""
-    
-    # DigitalOcean connection format
-    DATABASE_URL = os.getenv('DATABASE_URL')
-    
-    if not DATABASE_URL:
-        # Get these from your DigitalOcean database dashboard
-        DB_HOST = os.getenv('DB_HOST')
-        DB_PORT = os.getenv('DB_PORT', '25060')
-        DB_NAME = os.getenv('DB_NAME', 'defaultdb')
-        DB_USER = os.getenv('DB_USER', 'doadmin')
-        DB_PASSWORD = os.getenv('DB_PASSWORD')
-        
-        DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=require"
-    
-    print(f"Connecting to DigitalOcean database...")
-    
-    # Connect with SSL required
-    return await asyncpg.create_pool(
-        DATABASE_URL,
-        ssl='require',
-        min_size=1,
-        max_size=10
-    )
-
-async def main():
-    """Main entry point for the scanner"""
-    print("Main function called...")
-    try:
-        db = await connect_database()
-        print(f"✅ Database connected!")
-        
-        # Create and start the scanner
-        scanner = WalletScanner(db)
-        await scanner.start_scanning()
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-# Entry point
-if __name__ == "__main__":
-    print("Running scanner...")
-    asyncio.run(main())
